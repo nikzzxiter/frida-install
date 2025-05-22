@@ -1,0 +1,315 @@
+diff --git a/meson.build b/meson.build
+index aa96710..7455677 100644
+--- a/meson.build
++++ b/meson.build
+@@ -5,7 +5,12 @@ project('frida-python', 'c',
+   meson_version: '>=1.3.0',
+ )
+ 
+-python = import('python').find_installation()
++host_os = host_machine.system()
++if host_os == 'android'
++  host_os_family = 'linux'
++else
++  host_os_family = host_os
++endif
+ 
+ cc = meson.get_compiler('c')
+ 
+@@ -19,22 +24,80 @@ if ndebug == 'true' or (ndebug == 'if-release' and not get_option('debug'))
+   ]
+ endif
+ 
+-python_dep = python.dependency()
+-frida_core_dep = dependency('frida-core-1.0', default_options: [
+-  'frida_version=' + meson.project_version().replace('.dev', '-dev.'),
+-])
++target_conditionals_prefix = '#include <TargetConditionals.h>'
++
++is_macos_src = target_conditionals_prefix + '''
++#if !TARGET_OS_OSX
++# error Not macOS
++#endif
++'''
++if cc.compiles(is_macos_src, name: 'compiling for macOS')
++  host_os = 'macos'
++endif
++
++is_ios_src = target_conditionals_prefix + '''
++#if !TARGET_OS_IOS
++# error Not iOS
++#endif
++'''
++if cc.compiles(is_ios_src, name: 'compiling for iOS')
++  host_os = 'ios'
++endif
++
++if cc.has_header('android/api-level.h')
++  host_os = 'android'
++endif
++
++python_incdir = get_option('python_incdir')
++if python_incdir == ''
++  python = get_option('python')
++  if python == ''
++    python = find_program('python3', required: false)
++    if not python.found()
++      python = find_program('python')
++    endif
++  endif
++
++  result = run_command(python, '-c',
++    'import sys; sys.stdout.write(f"{sys.version_info[0]}.{sys.version_info[1]}")',
++    check: true)
++  python_version = result.stdout()
++  python_name = 'python' + python_version
++
++  result = run_command(python, '-c',
++    'from distutils import sysconfig; import sys; sys.stdout.write(sysconfig.get_python_inc())',
++    check: true)
++  python_incdir = result.stdout()
++else
++  py_major_v = cc.get_define('PY_MAJOR_VERSION',
++    prefix: '#include <patchlevel.h>',
++    args: ['-I' + python_incdir])
++
++  py_minor_v = cc.get_define('PY_MINOR_VERSION',
++    prefix: '#include <patchlevel.h>',
++    args: ['-I' + python_incdir])
++
++  python_version = py_major_v + '.' + py_minor_v
++  python_name = 'python' + python_version
++endif
++
++python_site_packages = join_paths(get_option('libdir'), python_name, 'site-packages')
++
++cdata = configuration_data()
+ 
++cdata.set('HAVE_' + host_os_family.to_upper(), 1)
++if host_os != host_os_family
++  cdata.set('HAVE_' + host_os.to_upper(), 1)
++endif
++
++frida_core_dep = dependency('frida-core-1.0')
+ os_deps = []
+-host_os_family = host_machine.system()
+ if host_os_family != 'windows'
+   os_deps += dependency('gio-unix-2.0')
+ endif
+ 
+-subdir('frida')
++configure_file(input: 'config.h.in',
++  output: 'config.h',
++  configuration: cdata)
+ 
+-test('frida-python', python,
+-  args: ['-m', 'unittest', 'discover'],
+-  workdir: meson.current_source_dir(),
+-  env: {'PYTHONPATH': meson.current_build_dir() / 'src'},
+-  timeout: 30,
+-)
++subdir('frida')
+diff --git a/setup.py b/setup.py
+index 488e047..25fd1e1 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1,25 +1,109 @@
+ import os
+ import platform
+ import shutil
+-import subprocess
+-import sys
+-from pathlib import Path
+-from typing import Iterator
+ 
+ from setuptools import setup
+ from setuptools.command.build_ext import build_ext
+ from setuptools.extension import Extension
+ 
+-SOURCE_ROOT = Path(__file__).resolve().parent
+-FRIDA_EXTENSION = os.environ.get("FRIDA_EXTENSION", None)
++package_dir = os.path.dirname(os.path.realpath(__file__))
++pkg_info = os.path.join(package_dir, "PKG-INFO")
++in_source_package = os.path.isfile(pkg_info)
++if in_source_package:
++    with open(pkg_info, "r", encoding="utf-8") as f:
++        version_line = [line for line in f if line.startswith("Version: ")][0].strip()
++    frida_version = version_line[9:]
++else:
++    frida_version = os.environ.get("FRIDA_VERSION", "0.0.0")
++with open(os.path.join(package_dir, "README.md"), "r", encoding="utf-8") as f:
++    long_description = f.read()
++frida_extension = os.environ.get("FRIDA_EXTENSION", None)
+ 
+ 
+-def main():
++class FridaPrebuiltExt(build_ext):
++    def build_extension(self, ext):
++        target = self.get_ext_fullpath(ext.name)
++        target_dir = os.path.dirname(target)
++        os.makedirs(target_dir, exist_ok=True)
++
++        shutil.copyfile(frida_extension, target)
++
++
++class FridaMissingDevkitBuildExt(build_ext):
++    def build_extension(self, ext):
++        raise RuntimeError(
++            "Need frida-core devkit to build from source.\n"
++            "Download one from https://github.com/frida/frida/releases, "
++            "extract it to a directory,\n"
++            "and then add an environment variable named FRIDA_CORE_DEVKIT "
++            "pointing at the directory."
++        )
++
++
++include_dirs = []
++library_dirs = []
++libraries = []
++extra_link_args = []
++
++cmdclass = {}
++if frida_extension is not None:
++    cmdclass["build_ext"] = FridaPrebuiltExt
++else:
++    devkit_dir = os.environ.get("FRIDA_CORE_DEVKIT", None)
++    if devkit_dir is not None:
++        include_dirs += [devkit_dir]
++        library_dirs += [devkit_dir]
++        libraries += ["frida-core"]
++
++        system = platform.system()
++        if system == "Windows":
++            pass
++        elif system == "Darwin":
++            extra_link_args += [
++                "-Wl,-exported_symbol,_PyInit__frida",
++                "-Wl,-dead_strip",
++            ]
++            if "_PYTHON_HOST_PLATFORM" not in os.environ:
++                if platform.machine() == "arm64":
++                    host_arch = "arm64"
++                    macos_req = "11.0"
++                else:
++                    host_arch = "x86_64"
++                    macos_req = "10.9"
++                os.environ["_PYTHON_HOST_PLATFORM"] = f"macosx-{macos_req}-{host_arch}"
++                os.environ["ARCHFLAGS"] = f"-arch {host_arch}"
++                os.environ["MACOSX_DEPLOYMENT_TARGET"] = macos_req
++        else:
++            version_script = os.path.join(package_dir, "frida/_frida", "extension.version")
++            if not os.path.exists(version_script):
++                with open(version_script, "w", encoding="utf-8") as f:
++                    f.write(
++                        "\n".join(
++                            [
++                                "{",
++                                "  global:",
++                                "    PyInit__frida;",
++                                "",
++                                "  local:",
++                                "    *;",
++                                "};",
++                            ]
++                        )
++                    )
++            extra_link_args += [
++                f"-Wl,--version-script,{version_script}",
++                "-Wl,--gc-sections",
++            ]
++    else:
++        cmdclass["build_ext"] = FridaMissingDevkitBuildExt
++
++
++if __name__ == "__main__":
+     setup(
+         name="frida",
+-        version=detect_version(),
++        version=frida_version,
+         description="Dynamic instrumentation toolkit for developers, reverse-engineers, and security researchers",
+-        long_description=compute_long_description(),
++        long_description=long_description,
+         long_description_content_type="text/markdown",
+         author="Frida Developers",
+         author_email="oleavr@frida.re",
+@@ -56,75 +140,13 @@ def main():
+             Extension(
+                 name="frida._frida",
+                 sources=["frida/_frida/extension.c"],
++                include_dirs=include_dirs,
++                library_dirs=library_dirs,
++                libraries=libraries,
++                extra_link_args=extra_link_args,
+                 py_limited_api=True,
+             )
+         ],
+-        cmdclass={"build_ext": FridaPrebuiltExt if FRIDA_EXTENSION is not None else FridaDemandBuiltExt},
++        cmdclass=cmdclass,
+         zip_safe=False,
+     )
+-
+-
+-def detect_version() -> str:
+-    pkg_info = SOURCE_ROOT / "PKG-INFO"
+-    in_source_package = pkg_info.exists()
+-    if in_source_package:
+-        version_line = [
+-            line for line in pkg_info.read_text(encoding="utf-8").split("\n") if line.startswith("Version: ")
+-        ][0].strip()
+-        return version_line[9:]
+-
+-    version = os.environ.get("FRIDA_VERSION")
+-    if version is not None:
+-        return version
+-
+-    releng_location = next(enumerate_releng_locations(), None)
+-    if releng_location is not None:
+-        sys.path.insert(0, str(releng_location.parent))
+-        from releng.frida_version import detect
+-
+-        return detect(SOURCE_ROOT).name.replace("-dev.", ".dev")
+-
+-    return "0.0.0"
+-
+-
+-def compute_long_description() -> str:
+-    return (SOURCE_ROOT / "README.md").read_text(encoding="utf-8")
+-
+-
+-def enumerate_releng_locations() -> Iterator[Path]:
+-    val = os.environ.get("MESON_SOURCE_ROOT")
+-    if val is not None:
+-        parent_releng = Path(val) / "releng"
+-        if releng_location_exists(parent_releng):
+-            yield parent_releng
+-
+-    local_releng = SOURCE_ROOT / "releng"
+-    if releng_location_exists(local_releng):
+-        yield local_releng
+-
+-
+-def releng_location_exists(location: Path) -> bool:
+-    return (location / "frida_version.py").exists()
+-
+-
+-class FridaPrebuiltExt(build_ext):
+-    def build_extension(self, ext):
+-        target = self.get_ext_fullpath(ext.name)
+-        Path(target).parent.mkdir(parents=True, exist_ok=True)
+-        shutil.copy(FRIDA_EXTENSION, target)
+-
+-
+-class FridaDemandBuiltExt(build_ext):
+-    def build_extension(self, ext):
+-        make = SOURCE_ROOT / "make.bat" if platform.system() == "Windows" else "make"
+-        subprocess.run([make], check=True)
+-
+-        outputs = [entry for entry in (SOURCE_ROOT / "build" / "frida" / "_frida").glob("_frida.*") if entry.is_file()]
+-        assert len(outputs) == 1
+-        target = self.get_ext_fullpath(ext.name)
+-        Path(target).parent.mkdir(parents=True, exist_ok=True)
+-        shutil.copy(outputs[0], target)
+-
+-
+-if __name__ == "__main__":
+-    main()
