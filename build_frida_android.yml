@@ -1,0 +1,99 @@
+name: "Build Frida for Android"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android_build:
+    strategy:
+      matrix:
+        arch: [x86, x86_64, arm, arm64]
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out repo
+      uses: actions/checkout@main
+      with:
+        fetch-depth: 0
+        submodules: recursive
+
+    - name: Setup ndk
+      id: setup-ndk
+      uses: nttld/setup-ndk@main
+      with:
+        ndk-version: r25b
+        add-to-path: false
+
+    - name: add ANDROID_NDK_ROOT to environment
+      run: |
+        echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+        echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+
+    - name: Create temp release
+      run: |
+        mkdir release-assets
+
+    - name: Get latest FRIDA_VERSION from Release
+      id: get_frida_version
+      run: |
+         echo "FRIDA_VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | jq -r .tag_name)" >> $GITHUB_OUTPUT
+
+    - name: Clone frida repository
+      shell: bash
+      run: |
+        git clone --recurse-submodules https://github.com/frida/frida
+
+    - name: Configure
+      run: cd frida && >-
+          ./configure
+          "--prefix=$FRIDA_PREFIX"
+          --host=android-${{ matrix.arch }}
+          --
+          -Dfrida-gum:devkits=gum,gumjs
+          -Dfrida-gum:jailbreak=disabled
+          -Dfrida-gum:gumpp=disabled
+          -Dfrida-gum:gumjs=enabled
+          -Dfrida-gum:v8=disabled
+          -Dfrida-gum:database=disabled
+          -Dfrida-gum:tests=disabled
+          -Dfrida-core:devkits=core
+          -Dfrida-core:connectivity=disabled
+          -Dfrida-core:mapper=enabled
+          -Dfrida-core:tests=disabled
+
+    - name: Compile frida 
+      run: cd frida && make && make install
+
+    - name: tar core devkit
+      run: cd release-assets && tar -cJvf frida-core-devkit-android-${{ matrix.arch }}.tar.xz -C ../frida${{ env.FRIDA_PREFIX }}/lib/frida/devkits/core/ .
+
+    - name: tar gum devkit
+      run: cd release-assets && tar -cJvf frida-gum-devkit-android-${{ matrix.arch }}.tar.xz -C ../frida${{ env.FRIDA_PREFIX }}/lib/frida/devkits/gum/ .
+
+    - name: tar gumjs devkit
+      run: cd release-assets && tar -cJvf frida-gumjs-devkit-android-${{ matrix.arch }}.tar.xz -C ../frida${{ env.FRIDA_PREFIX }}/lib/frida/devkits/gumjs/ .
+
+    - name: tar frida-inject
+      run: cd release-assets && tar -cJvf frida-inject-android-${{ matrix.arch }}.tar.xz -C ../frida${{ env.FRIDA_PREFIX }}/bin/ frida-inject
+
+    - name: tar frida-server
+      run: cd release-assets && tar -cJvf frida-server-android-${{ matrix.arch }}.tar.xz -C ../frida${{ env.FRIDA_PREFIX }}/bin/ frida-server      
+
+    - name: tar 32-bit frida-gadget
+      if: ${{ !contains(matrix.arch, '64') }}
+      run: cd release-assets && tar -cJvf frida-gadget-android-${{ matrix.arch }}.tar.xz -C ../frida${{ env.FRIDA_PREFIX }}/lib/frida/32/ frida-gadget.so
+
+    - name: tar 64-bit frida-gadget
+      if: ${{ contains(matrix.arch, '64') }}
+      run: cd release-assets && tar -cJvf frida-gadget-android-${{ matrix.arch }}.tar.xz -C ../frida${{ env.FRIDA_PREFIX }}/lib/frida/64/ frida-gadget.so
+
+    - name: Create release frida ${{ matrix.arch }}
+      uses: ncipollo/release-action@main
+      with:
+        tag: ${{ steps.get_frida_version.outputs.FRIDA_VERSION }}
+        name: "Frida ${{ steps.get_frida_version.outputs.FRIDA_VERSION }}"
+        allowUpdates: true
+        artifacts: release-assets/*
