@@ -28,14 +28,14 @@ cd $TMPDIR
 
 # Update and install required packages
 apt update && pkg upgrade -y
-pkg i -y python git curl && pip install -U setuptools
+pkg install -y python git curl && pip install -U setuptools
 
-# Fetch latest Frida version
-FRIDA_VERSION=$(curl -s https://api.github.com/repos/Alexjr2/Frida_Termux_Installation/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
+# Set specific Frida version
+FRIDA_VERSION="17.0.1"
 
-# Download Frida devkit
-DEVKIT_URL="https://github.com/Alexjr2/Frida_Termux_Installation/releases/latest/download/frida-core-devkit-android-$arch.tar.xz"
-DEVKIT_FILE="frida-core-devkit-android-$arch.tar.xz"
+# Download Frida devkit from your repository
+DEVKIT_URL="https://github.com/nikzzxiter/frida-install/releases/download/${FRIDA_VERSION}/frida-core-devkit-android-${arch}.tar.xz"
+DEVKIT_FILE="frida-core-devkit-android-${arch}.tar.xz"
 
 curl -L -o "$DEVKIT_FILE" "$DEVKIT_URL"
 
@@ -43,12 +43,13 @@ curl -L -o "$DEVKIT_FILE" "$DEVKIT_URL"
 mkdir -p devkit && tar -xJvf "$DEVKIT_FILE" -C devkit
 
 # Clone and install Frida Python
-git clone --depth 1 https://github.com/frida/frida-python.git
+git clone --depth 1 --branch ${FRIDA_VERSION} https://github.com/frida/frida-python.git
 
-# fix setup.py
 cd frida-python
-curl -LO https://raw.githubusercontent.com/Alexjr2/Frida_Termux_Installation/refs/heads/main/frida-python.patch
+
+# Apply patch from your repo
+curl -LO https://raw.githubusercontent.com/nikzzxiter/frida-install/main/frida-python.patch
 patch -p1 < frida-python.patch
 
-#install frida-python
+# Install frida-python
 FRIDA_VERSION="$FRIDA_VERSION" FRIDA_CORE_DEVKIT="$PWD/../devkit" pip install --force-reinstall .
